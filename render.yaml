@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: daily-spend-manager
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    disk:
+      name: database-storage
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /data/database.json
+      - key: NODE_ENV
+        value: production

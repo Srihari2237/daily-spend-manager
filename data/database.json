@@ -1,0 +1,55 @@
+{
+  "users": [
+    {
+      "id": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "name": "Sri Hari",
+      "createdAt": "2026-05-18T07:16:57.921Z",
+      "openingCash": 1075,
+      "openingBank": 1380,
+      "updatedAt": "2026-05-18T07:28:42.246Z"
+    }
+  ],
+  "transactions": [
+    {
+      "id": "txn_29cb9b75-e157-476f-a420-5cff2df7776a",
+      "userId": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "date": "2026-05-18",
+      "type": "expense",
+      "amount": 25,
+      "category": "tea",
+      "paymentMethod": "cash",
+      "note": "",
+      "createdAt": "2026-05-18T07:29:03.625Z",
+      "updatedAt": "2026-05-18T07:29:03.625Z"
+    },
+    {
+      "id": "txn_d5cf0a05-eae2-44e6-8601-c1f3f7f531a9",
+      "userId": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "date": "2026-05-18",
+      "type": "expense",
+      "amount": 50,
+      "category": "Food",
+      "paymentMethod": "cash",
+      "note": "",
+      "createdAt": "2026-05-18T07:29:08.156Z",
+      "updatedAt": "2026-05-18T07:29:08.156Z"
+    }
+  ],
+  "sessions": {
+    "sess_5a87c994-ce32-4576-b722-2de807e78dee": {
+      "userId": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "createdAt": "2026-05-18T07:16:57.921Z",
+      "lastSeenAt": "2026-05-18T07:36:50.153Z"
+    },
+    "sess_2d6aed99-db86-4f29-9faa-18243705357b": {
+      "userId": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "createdAt": "2026-05-18T07:20:30.034Z",
+      "lastSeenAt": "2026-05-18T07:20:30.059Z"
+    },
+    "sess_689f3f70-57fa-4acc-8dd9-94de8a1fa844": {
+      "userId": "usr_7bd49a47-61fe-4bf2-b584-f7207f58f9ac",
+      "createdAt": "2026-05-18T07:37:58.068Z",
+      "lastSeenAt": "2026-05-18T07:38:03.081Z"
+    }
+  }
+}

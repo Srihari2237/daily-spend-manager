@@ -1,0 +1,13 @@
+{
+  "id": "daily-spend-manager",
+  "title": "Build daily spend manager for shared desktop and phone use",
+  "status": "in_progress",
+  "complexity": "L+",
+  "risk": "medium",
+  "domain": "fullstack",
+  "status": "completed",
+  "currentPhase": "completed",
+  "nextAction": "Archive task; git commit unavailable because workspace has no repository",
+  "createdAt": "2026-05-18T07:01:56Z",
+  "branch": "no-git-repository"
+}

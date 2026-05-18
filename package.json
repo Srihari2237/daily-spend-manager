@@ -1,0 +1,46 @@
+{
+  "name": "daily-spend-manager",
+  "version": "1.0.0",
+  "description": "A small shared daily spending tracker for desktop and phone.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/api.test.js",
+    "electron": "electron electron-main.js",
+    "dist": "electron-builder",
+    "mobile:sync": "npx cap sync",
+    "mobile:open": "npx cap open android"
+  },
+  "build": {
+    "appId": "com.dailyspend.manager",
+    "productName": "Daily Spend Manager",
+    "files": [
+      "public/**/*",
+      "electron-main.js",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "keywords": [
+    "expense",
+    "budget",
+    "tracker"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@capacitor/cli": "^8.3.4",
+    "@capacitor/core": "^8.3.4",
+    "electron": "^42.1.0",
+    "electron-builder": "^26.8.1"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.3.4"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "section-tabs-dashboard-graph",
+  "title": "Make sidebar sections exclusive and add dashboard graph",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "low",
+  "domain": "frontend",
+  "currentPhase": "completed",
+  "nextAction": "Archive task; git commit unavailable because workspace has no repository",
+  "createdAt": "2026-05-18T07:33:00Z",
+  "branch": "no-git-repository"
+}

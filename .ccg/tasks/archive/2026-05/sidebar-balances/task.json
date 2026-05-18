@@ -1,0 +1,12 @@
+{
+  "id": "sidebar-balances",
+  "title": "Add section sidebar and saved cash/account balances",
+  "status": "completed",
+  "complexity": "M",
+  "risk": "medium",
+  "domain": "fullstack",
+  "currentPhase": "completed",
+  "nextAction": "Archive task; git commit unavailable because workspace has no repository",
+  "createdAt": "2026-05-18T07:23:00Z",
+  "branch": "no-git-repository"
+}
