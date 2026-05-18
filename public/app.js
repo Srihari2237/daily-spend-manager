@@ -50,7 +50,7 @@ function showToast(message) {
 }
 
 const API_BASE = (window.location.origin.startsWith('file') || window.location.origin.startsWith('capacitor')) 
-  ? 'https://your-hosted-app.onrender.com' 
+  ? 'https://daily-spend-manager.onrender.com' 
   : '';
 
 async function api(path, options = {}) {
