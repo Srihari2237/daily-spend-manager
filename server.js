@@ -3,8 +3,10 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
+const { MongoClient, ObjectId } = require("mongodb");
 
-const DEFAULT_DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, "data", "database.json");
+// Configuration
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/daily-spend";
 const DEFAULT_PUBLIC_DIR = path.join(__dirname, "public");
 const SESSION_COOKIE = "daily_spend_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
@@ -21,8 +23,16 @@ const MIME_TYPES = {
   ".ico": "image/x-icon"
 };
 
-function createId(prefix) {
-  return `${prefix}_${crypto.randomUUID()}`;
+let client;
+let db;
+
+async function connectToDatabase() {
+  if (db) return db;
+  client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db();
+  console.log("Connected to MongoDB");
+  return db;
 }
 
 function nowIso() {
@@ -33,59 +43,12 @@ function roundMoney(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function emptyDatabase() {
-  return {
-    users: [],
-    transactions: [],
-    sessions: {}
-  };
-}
-
-function ensureDatabase(dbPath) {
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  if (!fs.existsSync(dbPath)) {
-    fs.writeFileSync(dbPath, JSON.stringify(emptyDatabase(), null, 2));
-  }
-}
-
-function readDatabase(dbPath) {
-  ensureDatabase(dbPath);
-  const raw = fs.readFileSync(dbPath, "utf8");
-  const parsed = raw.trim() ? JSON.parse(raw) : emptyDatabase();
-  return {
-    users: Array.isArray(parsed.users) ? parsed.users.map(normalizeUserRecord) : [],
-    transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
-    sessions: parsed.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {}
-  };
-}
-
-function writeDatabase(dbPath, db) {
-  const tmpPath = `${dbPath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2));
-  fs.renameSync(tmpPath, dbPath);
-}
-
-function cleanupSessions(db) {
-  const cutoff = Date.now() - SESSION_TTL_MS;
-  for (const [token, session] of Object.entries(db.sessions)) {
-    const createdAt = Date.parse(session.createdAt || "");
-    if (!session.userId || Number.isNaN(createdAt) || createdAt < cutoff) {
-      delete db.sessions[token];
-    }
-  }
-}
-
 function parseCookies(header) {
   const cookies = {};
-  if (!header) {
-    return cookies;
-  }
-
+  if (!header) return cookies;
   for (const part of header.split(";")) {
     const [rawName, ...rawValue] = part.trim().split("=");
-    if (!rawName) {
-      continue;
-    }
+    if (!rawName) continue;
     cookies[rawName] = decodeURIComponent(rawValue.join("="));
   }
   return cookies;
@@ -93,9 +56,7 @@ function parseCookies(header) {
 
 function buildCookie(name, value, options = {}) {
   const parts = [`${name}=${encodeURIComponent(value)}`, "Path=/", "HttpOnly", "SameSite=Lax"];
-  if (options.maxAge !== undefined) {
-    parts.push(`Max-Age=${options.maxAge}`);
-  }
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
   return parts.join("; ");
 }
 
@@ -115,23 +76,12 @@ function sendNoContent(res, headers = {}) {
 }
 
 function normalizeDisplayName(name) {
-  return String(name || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .slice(0, 40);
-}
-
-function normalizeUserRecord(user) {
-  return {
-    ...user,
-    openingCash: roundMoney(user.openingCash),
-    openingBank: roundMoney(user.openingBank)
-  };
+  return String(name || "").trim().replace(/\s+/g, " ").slice(0, 40);
 }
 
 function publicUser(user) {
   return {
-    id: user.id,
+    id: user._id.toString(),
     name: user.name,
     createdAt: user.createdAt,
     openingCash: roundMoney(user.openingCash),
@@ -139,21 +89,24 @@ function publicUser(user) {
   };
 }
 
-function getActiveUser(req, db) {
+async function getActiveUser(req, dbInstance) {
   const cookies = parseCookies(req.headers.cookie || "");
   const token = cookies[SESSION_COOKIE];
-  if (!token || !db.sessions[token]) {
+  if (!token) return { user: null, token: null };
+
+  const session = await dbInstance.collection("sessions").findOne({ token });
+  if (!session || new Date(session.createdAt).getTime() < Date.now() - SESSION_TTL_MS) {
+    if (session) await dbInstance.collection("sessions").deleteOne({ token });
     return { user: null, token: null };
   }
 
-  const session = db.sessions[token];
-  const user = db.users.find((entry) => entry.id === session.userId);
+  const user = await dbInstance.collection("users").findOne({ _id: session.userId });
   if (!user) {
-    delete db.sessions[token];
+    await dbInstance.collection("sessions").deleteOne({ token });
     return { user: null, token: null };
   }
 
-  session.lastSeenAt = nowIso();
+  await dbInstance.collection("sessions").updateOne({ token }, { $set: { lastSeenAt: nowIso() } });
   return { user, token };
 }
 
@@ -172,11 +125,7 @@ function readRequestJson(req) {
         resolve({});
         return;
       }
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(new Error("Invalid JSON body"));
-      }
+      try { resolve(JSON.parse(body)); } catch (e) { reject(new Error("Invalid JSON body")); }
     });
     req.on("error", reject);
   });
@@ -184,22 +133,13 @@ function readRequestJson(req) {
 
 function parseDateInput(value) {
   const raw = String(value || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return null;
-  }
-
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
   const parsed = new Date(`${raw}T00:00:00.000Z`);
-  if (Number.isNaN(parsed.getTime())) {
-    return null;
-  }
-  return raw;
+  return Number.isNaN(parsed.getTime()) ? null : raw;
 }
 
 function cleanText(value, fallback, maxLength) {
-  const cleaned = String(value || "")
-    .trim()
-    .replace(/\s+/g, " ")
-    .slice(0, maxLength);
+  const cleaned = String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
   return cleaned || fallback;
 }
 
@@ -213,9 +153,7 @@ function validateBalanceAmount(value, label) {
 
 function validateTransaction(input) {
   const type = String(input.type || "").trim().toLowerCase();
-  if (!TRANSACTION_TYPES.has(type)) {
-    throw new Error("Choose a valid transaction type");
-  }
+  if (!TRANSACTION_TYPES.has(type)) throw new Error("Choose a valid transaction type");
 
   const amount = Number(input.amount);
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000000) {
@@ -223,14 +161,10 @@ function validateTransaction(input) {
   }
 
   const date = parseDateInput(input.date);
-  if (!date) {
-    throw new Error("Choose a valid date");
-  }
+  if (!date) throw new Error("Choose a valid date");
 
   const paymentMethod = String(input.paymentMethod || "").trim().toLowerCase();
-  if (!PAYMENT_METHODS.has(paymentMethod)) {
-    throw new Error("Choose a valid payment method");
-  }
+  if (!PAYMENT_METHODS.has(paymentMethod)) throw new Error("Choose a valid payment method");
 
   const fallbackCategory = type === "withdrawal" || type === "deposit" ? "Transfer" : "General";
 
@@ -250,87 +184,19 @@ function transactionImpact(transaction) {
   const impact = { cash: 0, bank: 0 };
 
   if (transaction.type === "expense") {
-    if (method === "cash") {
-      impact.cash -= amount;
-    } else {
-      impact.bank -= amount;
-    }
-  }
-
-  if (transaction.type === "income") {
-    if (method === "cash") {
-      impact.cash += amount;
-    } else {
-      impact.bank += amount;
-    }
-  }
-
-  if (transaction.type === "withdrawal") {
+    if (method === "cash") impact.cash -= amount;
+    else impact.bank -= amount;
+  } else if (transaction.type === "income") {
+    if (method === "cash") impact.cash += amount;
+    else impact.bank += amount;
+  } else if (transaction.type === "withdrawal") {
     impact.cash += amount;
     impact.bank -= amount;
-  }
-
-  if (transaction.type === "deposit") {
+  } else if (transaction.type === "deposit") {
     impact.cash -= amount;
     impact.bank += amount;
   }
-
   return impact;
-}
-
-function isWithinRange(transaction, filters) {
-  if (filters.from && transaction.date < filters.from) {
-    return false;
-  }
-  if (filters.to && transaction.date > filters.to) {
-    return false;
-  }
-  if (filters.type && filters.type !== "all" && transaction.type !== filters.type) {
-    return false;
-  }
-  if (
-    filters.paymentMethod &&
-    filters.paymentMethod !== "all" &&
-    transaction.paymentMethod !== filters.paymentMethod
-  ) {
-    return false;
-  }
-  if (filters.query) {
-    const haystack = `${transaction.category} ${transaction.note} ${transaction.type} ${transaction.paymentMethod}`.toLowerCase();
-    if (!haystack.includes(filters.query.toLowerCase())) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function filtersFromUrl(url) {
-  const month = url.searchParams.get("month");
-  const filters = {
-    from: url.searchParams.get("from") || "",
-    to: url.searchParams.get("to") || "",
-    type: url.searchParams.get("type") || "all",
-    paymentMethod: url.searchParams.get("paymentMethod") || "all",
-    query: url.searchParams.get("q") || ""
-  };
-
-  if (/^\d{4}-\d{2}$/.test(month || "")) {
-    filters.from = `${month}-01`;
-    const [year, monthIndex] = month.split("-").map(Number);
-    const lastDay = new Date(Date.UTC(year, monthIndex, 0)).getUTCDate();
-    filters.to = `${month}-${String(lastDay).padStart(2, "0")}`;
-  }
-
-  return filters;
-}
-
-function sortTransactions(transactions) {
-  return [...transactions].sort((a, b) => {
-    if (a.date !== b.date) {
-      return b.date.localeCompare(a.date);
-    }
-    return (b.createdAt || "").localeCompare(a.createdAt || "");
-  });
 }
 
 function addAmount(bucket, key, amount) {
@@ -338,15 +204,7 @@ function addAmount(bucket, key, amount) {
 }
 
 function summarizeTransactions(transactions) {
-  const totals = {
-    spending: 0,
-    income: 0,
-    withdrawn: 0,
-    deposited: 0,
-    cashBalance: 0,
-    bankBalance: 0,
-    net: 0
-  };
+  const totals = { spending: 0, income: 0, withdrawn: 0, deposited: 0, cashBalance: 0, bankBalance: 0, net: 0 };
   const byCategory = {};
   const byPaymentMethod = {};
   const byType = {};
@@ -354,7 +212,6 @@ function summarizeTransactions(transactions) {
   for (const transaction of transactions) {
     const amount = Number(transaction.amount) || 0;
     const impact = transactionImpact(transaction);
-
     totals.cashBalance += impact.cash;
     totals.bankBalance += impact.bank;
 
@@ -363,34 +220,16 @@ function summarizeTransactions(transactions) {
       addAmount(byCategory, transaction.category, amount);
       addAmount(byPaymentMethod, transaction.paymentMethod, amount);
     }
-    if (transaction.type === "income") {
-      totals.income += amount;
-    }
-    if (transaction.type === "withdrawal") {
-      totals.withdrawn += amount;
-    }
-    if (transaction.type === "deposit") {
-      totals.deposited += amount;
-    }
-
+    if (transaction.type === "income") totals.income += amount;
+    if (transaction.type === "withdrawal") totals.withdrawn += amount;
+    if (transaction.type === "deposit") totals.deposited += amount;
     addAmount(byType, transaction.type, amount);
   }
 
-  totals.cashBalance = Math.round(totals.cashBalance * 100) / 100;
-  totals.bankBalance = Math.round(totals.bankBalance * 100) / 100;
-  totals.spending = Math.round(totals.spending * 100) / 100;
-  totals.income = Math.round(totals.income * 100) / 100;
-  totals.withdrawn = Math.round(totals.withdrawn * 100) / 100;
-  totals.deposited = Math.round(totals.deposited * 100) / 100;
-  totals.net = Math.round((totals.income - totals.spending) * 100) / 100;
+  ["cashBalance", "bankBalance", "spending", "income", "withdrawn", "deposited"].forEach(k => totals[k] = roundMoney(totals[k]));
+  totals.net = roundMoney(totals.income - totals.spending);
 
-  return {
-    totals,
-    byCategory,
-    byPaymentMethod,
-    byType,
-    recent: sortTransactions(transactions).slice(0, 5)
-  };
+  return { totals, byCategory, byPaymentMethod, byType };
 }
 
 function summarizeBalances(user, transactions) {
@@ -409,13 +248,8 @@ function summarizeBalances(user, transactions) {
   };
 }
 
-function extractTransactionId(pathname) {
-  const match = pathname.match(/^\/api\/transactions\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function requireUser(req, res, db) {
-  const { user, token } = getActiveUser(req, db);
+async function requireUser(req, res, dbInstance) {
+  const { user, token } = await getActiveUser(req, dbInstance);
   if (!user) {
     sendJson(res, 401, { error: "Login required" });
     return null;
@@ -423,43 +257,38 @@ function requireUser(req, res, db) {
   return { user, token };
 }
 
-async function handleApi(req, res, url, dbPath) {
-  const db = readDatabase(dbPath);
-  cleanupSessions(db);
+async function handleApi(req, res, url) {
+  const dbInstance = await connectToDatabase();
 
   if (req.method === "GET" && url.pathname === "/api/users") {
-    writeDatabase(dbPath, db);
-    sendJson(res, 200, { users: db.users.map(publicUser).sort((a, b) => a.name.localeCompare(b.name)) });
+    const users = await dbInstance.collection("users").find().sort({ name: 1 }).toArray();
+    sendJson(res, 200, { users: users.map(publicUser) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/login") {
     const input = await readRequestJson(req);
     const name = normalizeDisplayName(input.name);
-    if (!name) {
-      sendJson(res, 400, { error: "Enter an account name" });
-      return;
-    }
+    if (!name) return sendJson(res, 400, { error: "Enter an account name" });
 
-    let user = db.users.find((entry) => entry.name.toLowerCase() === name.toLowerCase());
+    let user = await dbInstance.collection("users").findOne({ name: { $regex: new RegExp(`^${name}$`, "i") } });
     if (!user) {
-      user = {
-        id: createId("usr"),
+      const result = await dbInstance.collection("users").insertOne({
         name,
         openingCash: 0,
         openingBank: 0,
         createdAt: nowIso()
-      };
-      db.users.push(user);
+      });
+      user = await dbInstance.collection("users").findOne({ _id: result.insertedId });
     }
 
-    const token = createId("sess");
-    db.sessions[token] = {
-      userId: user.id,
+    const token = crypto.randomUUID();
+    await dbInstance.collection("sessions").insertOne({
+      token,
+      userId: user._id,
       createdAt: nowIso(),
       lastSeenAt: nowIso()
-    };
-    writeDatabase(dbPath, db);
+    });
     sendJson(res, 200, { user: publicUser(user) }, { "Set-Cookie": buildCookie(SESSION_COOKIE, token) });
     return;
   }
@@ -467,16 +296,14 @@ async function handleApi(req, res, url, dbPath) {
   if (req.method === "POST" && url.pathname === "/api/logout") {
     const cookies = parseCookies(req.headers.cookie || "");
     if (cookies[SESSION_COOKIE]) {
-      delete db.sessions[cookies[SESSION_COOKIE]];
+      await dbInstance.collection("sessions").deleteOne({ token: cookies[SESSION_COOKIE] });
     }
-    writeDatabase(dbPath, db);
     sendNoContent(res, { "Set-Cookie": buildCookie(SESSION_COOKIE, "", { maxAge: 0 }) });
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/session") {
-    const active = getActiveUser(req, db);
-    writeDatabase(dbPath, db);
+    const active = await getActiveUser(req, dbInstance);
     sendJson(res, 200, {
       authenticated: Boolean(active.user),
       user: active.user ? publicUser(active.user) : null
@@ -485,12 +312,9 @@ async function handleApi(req, res, url, dbPath) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/profile") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
-    }
-    const userTransactions = db.transactions.filter((transaction) => transaction.userId === active.user.id);
-    writeDatabase(dbPath, db);
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
+    const userTransactions = await dbInstance.collection("transactions").find({ userId: active.user._id }).toArray();
     sendJson(res, 200, {
       user: publicUser(active.user),
       balances: summarizeBalances(active.user, userTransactions)
@@ -499,225 +323,177 @@ async function handleApi(req, res, url, dbPath) {
   }
 
   if (req.method === "PUT" && url.pathname === "/api/profile") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
-    }
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
     const input = await readRequestJson(req);
-    active.user.openingCash = validateBalanceAmount(input.openingCash, "cash in hand");
-    active.user.openingBank = validateBalanceAmount(input.openingBank, "bank account");
-    active.user.updatedAt = nowIso();
-    const userTransactions = db.transactions.filter((transaction) => transaction.userId === active.user.id);
-    writeDatabase(dbPath, db);
+    const updates = {
+      openingCash: validateBalanceAmount(input.openingCash, "cash in hand"),
+      openingBank: validateBalanceAmount(input.openingBank, "bank account"),
+      updatedAt: nowIso()
+    };
+    await dbInstance.collection("users").updateOne({ _id: active.user._id }, { $set: updates });
+    const updatedUser = { ...active.user, ...updates };
+    const userTransactions = await dbInstance.collection("transactions").find({ userId: active.user._id }).toArray();
     sendJson(res, 200, {
-      user: publicUser(active.user),
-      balances: summarizeBalances(active.user, userTransactions)
+      user: publicUser(updatedUser),
+      balances: summarizeBalances(updatedUser, userTransactions)
     });
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/transactions") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
+    
+    const query = { userId: active.user._id };
+    const month = url.searchParams.get("month");
+    if (/^\d{4}-\d{2}$/.test(month || "")) {
+      query.date = { $regex: `^${month}` };
     }
-    const filters = filtersFromUrl(url);
-    const transactions = sortTransactions(
-      db.transactions.filter((transaction) => transaction.userId === active.user.id && isWithinRange(transaction, filters))
-    );
-    writeDatabase(dbPath, db);
-    sendJson(res, 200, { transactions });
+    const type = url.searchParams.get("type");
+    if (type && type !== "all") query.type = type;
+    const method = url.searchParams.get("paymentMethod");
+    if (method && method !== "all") query.paymentMethod = method;
+    const q = url.searchParams.get("q");
+    if (q) {
+      query.$or = [
+        { category: { $regex: q, $options: "i" } },
+        { note: { $regex: q, $options: "i" } }
+      ];
+    }
+
+    const transactions = await dbInstance.collection("transactions")
+      .find(query)
+      .sort({ date: -1, createdAt: -1 })
+      .toArray();
+
+    sendJson(res, 200, { transactions: transactions.map(t => ({ ...t, id: t._id.toString() })) });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/transactions") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
-    }
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
     const input = await readRequestJson(req);
     const cleaned = validateTransaction(input);
     const createdAt = nowIso();
-    const transaction = {
-      id: createId("txn"),
-      userId: active.user.id,
+    const result = await dbInstance.collection("transactions").insertOne({
+      userId: active.user._id,
       ...cleaned,
       createdAt,
       updatedAt: createdAt
-    };
-    db.transactions.push(transaction);
-    writeDatabase(dbPath, db);
-    sendJson(res, 201, { transaction });
+    });
+    sendJson(res, 201, { transaction: { ...cleaned, id: result.insertedId.toString() } });
     return;
   }
 
-  const transactionId = extractTransactionId(url.pathname);
-  if (transactionId && req.method === "PUT") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
-    }
-    const index = db.transactions.findIndex(
-      (transaction) => transaction.id === transactionId && transaction.userId === active.user.id
-    );
-    if (index === -1) {
-      sendJson(res, 404, { error: "Transaction not found" });
+  const txnMatch = url.pathname.match(/^\/api\/transactions\/([^/]+)$/);
+  if (txnMatch) {
+    const txnId = txnMatch[1];
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
+
+    if (req.method === "PUT") {
+      const input = await readRequestJson(req);
+      const cleaned = validateTransaction(input);
+      const result = await dbInstance.collection("transactions").findOneAndUpdate(
+        { _id: new ObjectId(txnId), userId: active.user._id },
+        { $set: { ...cleaned, updatedAt: nowIso() } },
+        { returnDocument: "after" }
+      );
+      if (!result.value) return sendJson(res, 404, { error: "Transaction not found" });
+      sendJson(res, 200, { transaction: { ...result.value, id: result.value._id.toString() } });
       return;
     }
 
-    const input = await readRequestJson(req);
-    const cleaned = validateTransaction(input);
-    const updated = {
-      ...db.transactions[index],
-      ...cleaned,
-      updatedAt: nowIso()
-    };
-    db.transactions[index] = updated;
-    writeDatabase(dbPath, db);
-    sendJson(res, 200, { transaction: updated });
-    return;
-  }
-
-  if (transactionId && req.method === "DELETE") {
-    const active = requireUser(req, res, db);
-    if (!active) {
+    if (req.method === "DELETE") {
+      const result = await dbInstance.collection("transactions").deleteOne({ _id: new ObjectId(txnId), userId: active.user._id });
+      if (result.deletedCount === 0) return sendJson(res, 404, { error: "Transaction not found" });
+      sendNoContent(res);
       return;
     }
-    const originalLength = db.transactions.length;
-    db.transactions = db.transactions.filter(
-      (transaction) => !(transaction.id === transactionId && transaction.userId === active.user.id)
-    );
-    if (db.transactions.length === originalLength) {
-      sendJson(res, 404, { error: "Transaction not found" });
-      return;
-    }
-    writeDatabase(dbPath, db);
-    sendNoContent(res);
-    return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/summary") {
-    const active = requireUser(req, res, db);
-    if (!active) {
-      return;
+    const active = await requireUser(req, res, dbInstance);
+    if (!active) return;
+    
+    const query = { userId: active.user._id };
+    const month = url.searchParams.get("month");
+    if (/^\d{4}-\d{2}$/.test(month || "")) {
+      query.date = { $regex: `^${month}` };
     }
-    const filters = filtersFromUrl(url);
-    const userTransactions = db.transactions.filter((transaction) => transaction.userId === active.user.id);
-    const transactions = userTransactions.filter((transaction) => isWithinRange(transaction, filters));
-    const summary = summarizeTransactions(transactions);
+
+    const [userTransactions, filteredTransactions] = await Promise.all([
+      dbInstance.collection("transactions").find({ userId: active.user._id }).toArray(),
+      dbInstance.collection("transactions").find(query).toArray()
+    ]);
+
+    const summary = summarizeTransactions(filteredTransactions);
     summary.balances = summarizeBalances(active.user, userTransactions);
-    writeDatabase(dbPath, db);
     sendJson(res, 200, { summary });
     return;
   }
 
-  writeDatabase(dbPath, db);
   sendJson(res, 404, { error: "API route not found" });
 }
 
 function sendStatic(req, res, url, publicDir) {
   let pathname;
-  try {
-    pathname = decodeURIComponent(url.pathname);
-  } catch (error) {
-    sendJson(res, 400, { error: "Invalid path" });
-    return;
-  }
-
+  try { pathname = decodeURIComponent(url.pathname); } catch (e) { return sendJson(res, 400, { error: "Invalid path" }); }
   const requestPath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
   const publicRoot = path.resolve(publicDir);
   const filePath = path.resolve(publicRoot, requestPath);
-
-  if (!filePath.startsWith(publicRoot)) {
-    sendJson(res, 403, { error: "Forbidden" });
-    return;
-  }
+  if (!filePath.startsWith(publicRoot)) return sendJson(res, 403, { error: "Forbidden" });
 
   fs.readFile(filePath, (error, content) => {
     if (error) {
       if (pathname !== "/") {
         const fallback = path.join(publicRoot, "index.html");
-        fs.readFile(fallback, (fallbackError, fallbackContent) => {
-          if (fallbackError) {
-            sendJson(res, 404, { error: "File not found" });
-            return;
-          }
+        fs.readFile(fallback, (fError, fContent) => {
+          if (fError) return sendJson(res, 404, { error: "File not found" });
           res.writeHead(200, { "Content-Type": MIME_TYPES[".html"] });
-          res.end(fallbackContent);
+          res.end(fContent);
         });
         return;
       }
-      sendJson(res, 404, { error: "File not found" });
-      return;
+      return sendJson(res, 404, { error: "File not found" });
     }
-
     const extension = path.extname(filePath);
     res.writeHead(200, { "Content-Type": MIME_TYPES[extension] || "application/octet-stream" });
     res.end(content);
   });
 }
 
-function createServer(options = {}) {
-  const dbPath = options.dbPath || DEFAULT_DB_PATH;
-  const publicDir = options.publicDir || DEFAULT_PUBLIC_DIR;
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const origin = req.headers.origin;
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Set-Cookie");
 
-  return http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
-    // Global CORS handling
-    const origin = req.headers.origin;
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Set-Cookie");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
+  try {
+    if (url.pathname.startsWith("/api/")) {
+      await handleApi(req, res, url);
       return;
     }
-
-    try {
-      if (url.pathname.startsWith("/api/")) {
-        await handleApi(req, res, url, dbPath);
-        return;
-      }
-      sendStatic(req, res, url, publicDir);
-    } catch (error) {
-      const status = error.message === "Invalid JSON body" || error.message === "Request body is too large" ? 400 : 500;
-      sendJson(res, status, { error: error.message || "Server error" });
-    }
-  });
-}
-
-function getLanAddresses() {
-  const addresses = [];
-  for (const interfaces of Object.values(os.networkInterfaces())) {
-    for (const details of interfaces || []) {
-      if (details.family === "IPv4" && !details.internal) {
-        addresses.push(details.address);
-      }
-    }
+    sendStatic(req, res, url, DEFAULT_PUBLIC_DIR);
+  } catch (error) {
+    const status = (error.message === "Invalid JSON body" || error.message === "Request body is too large") ? 400 : 500;
+    sendJson(res, status, { error: error.message || "Server error" });
   }
-  return addresses;
-}
+});
 
-if (require.main === module) {
-  const port = Number(process.env.PORT || 3000);
-  const host = process.env.HOST || "0.0.0.0";
-  const server = createServer();
+const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST || "0.0.0.0";
 
-  server.listen(port, host, () => {
-    console.log(`Daily Spend Manager running at http://localhost:${port}`);
-    for (const address of getLanAddresses()) {
-      console.log(`Same Wi-Fi: http://${address}:${port}`);
-    }
-  });
-}
-
-module.exports = {
-  createServer,
-  summarizeTransactions,
-  summarizeBalances,
-  transactionImpact
-};
+server.listen(port, host, () => {
+  console.log(`Daily Spend Manager running at http://localhost:${port}`);
+});

@@ -5,12 +5,8 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: node server.js
-    disk:
-      name: database-storage
-      mountPath: /data
-      sizeGB: 1
     envVars:
-      - key: DATABASE_PATH
-        value: /data/database.json
+      - key: MONGODB_URI
+        sync: false
       - key: NODE_ENV
         value: production
